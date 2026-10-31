@@ -3,6 +3,7 @@
 Robot que automatiza el trabajo con las fotografías de WhatsApp de las visitas socioeconómicas del
 Programa de Aporte Económico del Adulto Mayor (RGA): lee cada foto, identifica a la persona, renombra
 los archivos con el formato que exige la macro y arma el informe de Word.
+**nota:** se le envió un correo de invitación para que pueda visualizar nuestra documentacion en azure
 
 > **Resultado:** el proceso manual de descargar, renombrar y dar formato a las fotos tomaba cerca de
 > **10 horas**; con el robot toma alrededor de **10 minutos** (reducción de 98 %).
