@@ -140,6 +140,3 @@ Las fotos y los DPI son datos personales de adultos mayores. **No subir imágene
   la votación entre seis lecturas lo compensa casi siempre.
 - Si el selector de carpeta parece no abrir, puede estar detrás de otra ventana: `Alt + Tab`.
 
-## Equipo
-
-*(Completar: nombres de los integrantes, curso y docente.)*
