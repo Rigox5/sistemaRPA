@@ -1,0 +1,294 @@
+---
+title: "Macro de Word: armado del informe de fotos y DPI"
+subtitle: "Módulo ProcesarCarpeta (VBA) documentado"
+author: "Equipo del proyecto RPA"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+# Qué hace la macro
+
+`ProcesarCarpeta` toma la carpeta `_salida` que deja el programa de Python y **arma el informe de Word**. Por cada persona agrega, en este orden:
+
+| Página | Contenido | Archivos |
+|---|---|---|
+| 1 | Fotos de la vivienda (3 por página) | `nombre_2`, `nombre_3`, `nombre_4`… |
+| 2 | Foto de medio cuerpo | `nombre_1` |
+| 3 | DPI, frente y reverso | `nombre_DPI1`, `nombre_DPI2` |
+
+Las personas se ordenan por la **fecha de modificación** de `nombre_1.jpg`, que el programa de Python asigna con la hora de la visita.
+
+## Cómo se instala y se usa
+
+- **Instalación:** `Alt + F11` en Word, *Insertar > Módulo*, pegar el código. El archivo debe guardarse como `.docm` (documento con macros). Pegar el bloque del final en `ThisDocument`.
+- **Desde el robot:** UiPath abre una copia de `C:\RpaFotos\Plantilla_fotos.docm`, ejecuta `ProcesarCarpeta` sobre `_salida` en modo silencioso y guarda el informe como `Informe_fotos_HHMMSS.docm`.
+- **A mano:** botón del documento; elegir la carpeta con las fotos renombradas.
+
+## Dónde encaja
+
+```
+Carpeta de fotos ─► UiPath ─► Python (renombra) ─► [ Word: ProcesarCarpeta ] ─► Informe .docm
+```
+
+# Código documentado
+
+## 1. Cabecera del módulo
+
+Se pega en un **módulo nuevo** (*Insertar > Módulo*), no en `ThisDocument`. `Option Explicit` obliga a declarar todas las variables, lo que evita errores por nombres mal escritos.
+
+```vbnet
+Option Explicit
+
+' ============================================================
+' Pegar este codigo en un MODULO NUEVO (Insertar > Modulo),
+' NO en ThisDocument. Debe ser Public para que el robot pueda llamarlo.
+' ============================================================
+```
+
+## 2. Declaración y parámetros
+
+`ProcesarCarpeta` es `Public` para que el robot de UiPath pueda llamarla con `app.Run("ProcesarCarpeta", salida, True)`. Recibe la carpeta con las fotos ya renombradas por el programa de Python y un parámetro opcional `silencioso`: con `True` (cuando la llama el robot) no muestra cuadros de mensaje; con `False` (botón manual) sí. Abajo se declaran las variables: el sistema de archivos (`fso`), el diccionario de nombres, las formas de imagen y los rangos de cada página.
+
+```vbnet
+Public Sub ProcesarCarpeta(ByVal carpeta As String, Optional ByVal silencioso As Boolean = False)
+    Dim archivo As String
+    Dim fso As Object, folder As Object, file As Object
+    Dim baseNames As Object
+    Dim key As Variant
+    Dim nombreBase As String, nombreFoto As String
+    Dim shp As Shape, img As InlineShape
+    Dim anchoVertical As Single, anchoHorizontal As Single
+    Dim margenTop As Single, espaciado As Single
+    Dim doc As Document
+    Dim rngRostro As Range, rngVivienda As Range, rngDPI As Range
+    Dim j As Integer, pageWidth As Single, pageHeight As Single
+    Dim anchoDPI As Single, espaciadoDPI As Single
+    Dim sortedKeys() As String, sortedDates() As Date
+    Dim i As Integer, n As Integer, temp As String, tempDate As Date
+    Dim slot As Integer
+```
+
+## 3. Medidas de la página
+
+Las medidas se dan en centímetros y se convierten a puntos (1 cm = 28.35 puntos). Las fotos de vivienda y el retrato miden 8 cm de ancho; el DPI, 8.5 cm. `espaciado` (8.5 cm) es la separación vertical entre fotos de vivienda y `espaciadoDPI` (1.5 cm) entre frente y reverso. `pageWidth` y `pageHeight` son el área útil de la hoja (sin márgenes) y sirven para centrar.
+
+```vbnet
+    Set doc = ActiveDocument
+
+    ' Medidas de las fotos de vivienda y rostro
+    anchoVertical = 8 * 28.35
+    anchoHorizontal = 8 * 28.35
+    margenTop = 2 * 28.35
+    espaciado = 8.5 * 28.35
+
+    ' Medidas para el DPI
+    anchoDPI = 8.5 * 28.35
+    espaciadoDPI = 1.5 * 28.35
+
+    pageWidth = doc.PageSetup.PageWidth - doc.PageSetup.LeftMargin - doc.PageSetup.RightMargin
+    pageHeight = doc.PageSetup.PageHeight - doc.PageSetup.TopMargin - doc.PageSetup.BottomMargin
+```
+
+## 4. Validar la carpeta y leer los nombres
+
+Comprueba que la carpeta exista y recorre sus archivos buscando los que terminan en `_1.jpg` (los retratos). Cada uno aporta una **persona** (el nombre sin el `_1`) y su **fecha de modificación**, que el programa de Python fijó con la hora de la visita. Los nombres se guardan en un diccionario. Si no hay ninguno, la macro termina con un aviso (solo si no es silenciosa).
+
+```vbnet
+    If Right(carpeta, 1) <> "\" Then carpeta = carpeta & "\"
+
+    ' Obtiene los nombres base y sus fechas
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FolderExists(carpeta) Then
+        If Not silencioso Then MsgBox "La carpeta no existe: " & carpeta, vbExclamation
+        Exit Sub
+    End If
+    Set folder = fso.GetFolder(carpeta)
+    Set baseNames = CreateObject("Scripting.Dictionary")
+
+    For Each file In folder.Files
+        If LCase(fso.GetExtensionName(file.Name)) = "jpg" Then
+            nombreFoto = fso.GetBaseName(file.Name)
+            If Right(nombreFoto, 2) = "_1" Then
+                nombreBase = Left(nombreFoto, Len(nombreFoto) - 2)
+                If Not baseNames.Exists(nombreBase) Then
+                    baseNames.Add nombreBase, file.DateLastModified
+                End If
+            End If
+        End If
+    Next
+
+    n = baseNames.Count
+    If n = 0 Then
+        If Not silencioso Then MsgBox "No se encontraron imagenes con el formato correcto.", vbExclamation
+        Exit Sub
+    End If
+```
+
+## 5. Ordenar a las personas por fecha
+
+Pasa el diccionario a dos arreglos (nombres y fechas) y los ordena con un **ordenamiento de burbuja** por fecha. Así el informe sale en el orden en que se hicieron las visitas.
+
+```vbnet
+    ReDim sortedKeys(1 To n)
+    ReDim sortedDates(1 To n)
+
+    i = 1
+    For Each key In baseNames.Keys
+        sortedKeys(i) = key
+        sortedDates(i) = baseNames(key)
+        i = i + 1
+    Next
+
+    ' Ordenamiento burbuja por fecha
+    For i = 1 To n - 1
+        For j = i + 1 To n
+            If sortedDates(i) > sortedDates(j) Then
+                tempDate = sortedDates(i)
+                sortedDates(i) = sortedDates(j)
+                sortedDates(j) = tempDate
+                temp = sortedKeys(i)
+                sortedKeys(i) = sortedKeys(j)
+                sortedKeys(j) = temp
+            End If
+        Next j
+    Next i
+```
+
+## 6. Página 1: fotos de la vivienda
+
+Por cada persona, en orden: inserta un salto de página y agrega las fotos `_2`, `_3`, `_4`… (hasta `_30`). Cada foto se inserta, se convierte en forma (`ConvertToShape`) para poder moverla, se fija el ancho, se rota 270° y se centra; `slot` (0, 1 o 2) decide su altura, de modo que caben **3 fotos por página**. A partir de la quinta (`j > 4`) se abre una página nueva cada 3 fotos. Cuando una foto no existe y ya se pasó de la cuarta, el ciclo termina (`Exit For`).
+
+```vbnet
+    ' Procesar en orden
+    For i = 1 To n
+        key = sortedKeys(i)
+
+        ' PAGINA 1: Fotos de vivienda (_2, _3, _4 y, si hay, _5, _6...: 3 por pagina)
+        Set rngVivienda = doc.Range
+        rngVivienda.Collapse Direction:=wdCollapseEnd
+        rngVivienda.InsertBreak Type:=wdPageBreak
+        rngVivienda.Collapse Direction:=wdCollapseEnd
+
+        For j = 2 To 30
+            archivo = carpeta & key & "_" & j & ".jpg"
+            If Dir(archivo) <> "" Then
+                slot = (j - 2) Mod 3
+                If j > 4 And slot = 0 Then
+                    ' Pagina nueva cada 3 fotos de vivienda
+                    Set rngVivienda = doc.Range
+                    rngVivienda.Collapse Direction:=wdCollapseEnd
+                    rngVivienda.InsertBreak Type:=wdPageBreak
+                    rngVivienda.Collapse Direction:=wdCollapseEnd
+                End If
+                Set img = doc.InlineShapes.AddPicture(FileName:=archivo, LinkToFile:=False, SaveWithDocument:=True, Range:=rngVivienda)
+                Set shp = img.ConvertToShape
+                With shp
+                    .LockAspectRatio = msoTrue
+                    .Width = anchoHorizontal
+                    .Rotation = 270
+                    .Left = (pageWidth - .Width) / 2
+                    .Top = margenTop + slot * espaciado
+                End With
+            ElseIf j > 4 Then
+                Exit For
+            End If
+        Next j
+```
+
+## 7. Página 2: foto de medio cuerpo
+
+Inserta un salto de página y, si existe `nombre_1.jpg`, coloca el retrato centrado en la hoja (horizontal y verticalmente), con proporción bloqueada.
+
+```vbnet
+        ' PAGINA 2: Foto de rostro/medio cuerpo (_1)
+        Set rngRostro = doc.Range
+        rngRostro.Collapse Direction:=wdCollapseEnd
+        rngRostro.InsertBreak Type:=wdPageBreak
+        rngRostro.Collapse Direction:=wdCollapseEnd
+
+        archivo = carpeta & key & "_1.jpg"
+        If Dir(archivo) <> "" Then
+            Set img = doc.InlineShapes.AddPicture(FileName:=archivo, LinkToFile:=False, SaveWithDocument:=True, Range:=rngRostro)
+            Set shp = img.ConvertToShape
+            With shp
+                .LockAspectRatio = msoTrue
+                .Width = anchoVertical
+                .Left = (pageWidth - .Width) / 2
+                .Top = (pageHeight - .Height) / 2
+            End With
+        End If
+```
+
+## 8. Página 3: DPI
+
+Nueva página con `nombre_DPI1.jpg` (frente) arriba y `nombre_DPI2.jpg` (reverso) debajo, ambos de 8.5 cm y centrados. Cada forma recibe un nombre (`DPI_<persona>_1` y `DPI_<persona>_2`) para que el botón de orientación pueda encontrarlas y girarlas si hace falta. Con `Next i` termina el ciclo de personas.
+
+```vbnet
+        ' PAGINA 3: DPI (_DPI1 y _DPI2) - sin rotacion inicial
+        Set rngDPI = doc.Range
+        rngDPI.Collapse Direction:=wdCollapseEnd
+        rngDPI.InsertBreak Type:=wdPageBreak
+        rngDPI.Collapse Direction:=wdCollapseEnd
+
+        archivo = carpeta & key & "_DPI1.jpg"
+        If Dir(archivo) <> "" Then
+            Set img = doc.InlineShapes.AddPicture(FileName:=archivo, LinkToFile:=False, SaveWithDocument:=True, Range:=rngDPI)
+            Set shp = img.ConvertToShape
+            With shp
+                .LockAspectRatio = msoTrue
+                .Width = anchoDPI
+                .Name = "DPI_" & key & "_1"
+                .Left = (pageWidth - .Width) / 2
+                .Top = margenTop
+            End With
+        End If
+
+        archivo = carpeta & key & "_DPI2.jpg"
+        If Dir(archivo) <> "" Then
+            Set img = doc.InlineShapes.AddPicture(FileName:=archivo, LinkToFile:=False, SaveWithDocument:=True, Range:=rngDPI)
+            Set shp = img.ConvertToShape
+            With shp
+                .LockAspectRatio = msoTrue
+                .Width = anchoDPI
+                .Name = "DPI_" & key & "_2"
+                .Left = (pageWidth - .Width) / 2
+                .Top = margenTop + anchoDPI + espaciadoDPI
+            End With
+        End If
+
+    Next i
+```
+
+## 9. Mensaje final
+
+Si la macro no es silenciosa, avisa que terminó e indica que el botón de orientación sirve para girar los DPI.
+
+```vbnet
+    If Not silencioso Then
+        MsgBox "Imagenes y DPIs insertados correctamente." & vbCrLf & vbCrLf & _
+               "Usa el boton de orientacion para rotar los DPIs si es necesario.", vbInformation
+    End If
+End Sub
+```
+
+## 10. Botón manual (va en ThisDocument)
+
+Bloque comentado que se pega en `ThisDocument` para que el botón del documento siga funcionando a mano: abre el selector de carpeta y llama a `ProcesarCarpeta` sin el parámetro `silencioso`, así que muestra los mensajes.
+
+```vbnet
+' ============================================================
+' Pegar esto en ThisDocument, REEMPLAZANDO el BotonAjustar_Click
+' actual (el boton sigue funcionando igual para uso manual).
+' ============================================================
+'Private Sub BotonAjustar_Click()
+'    Dim dlg As FileDialog
+'    Set dlg = Application.FileDialog(msoFileDialogFolderPicker)
+'    dlg.Title = "Selecciona la carpeta con las imagenes"
+'    If dlg.Show <> -1 Then Exit Sub
+'    ProcesarCarpeta dlg.SelectedItems(1)
+'End Sub
+```
+

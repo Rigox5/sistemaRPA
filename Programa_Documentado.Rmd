@@ -1,0 +1,1382 @@
+---
+title: "Programa de Python: lectura, agrupación y renombrado de fotos y DPI"
+subtitle: "organizar_fotos.py documentado"
+author: "Equipo del proyecto RPA"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: false
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+# Este documento es la versión explicada de organizar_fotos.py.
+# El código no se ejecuta al tejerlo (eval = FALSE): solo se muestra con su explicación.
+knitr::opts_chunk$set(eval = FALSE, echo = TRUE)
+```
+
+# Qué hace el programa
+
+`organizar_fotos.py` recibe una carpeta con fotografías de WhatsApp y las deja listas para armar el informe de Word:
+
+1. **Lee** la etiqueta que la cámara imprime en cada foto (hora y nota con el nombre) mediante OCR.
+2. **Agrupa** las fotos de la misma persona.
+3. **Elige el retrato** (la cara más grande) y ordena las fotos de la vivienda por hora.
+4. **Empareja** frente y reverso del DPI con el CUI y su dígito de control.
+5. **Copia y renombra** (`nombre_1.jpg`, `nombre_2.jpg`… `nombre_DPI1.jpg`, `nombre_DPI2.jpg`). Lo dudoso va a `Revision_manual`.
+6. **Registra** todo en `registro_fotos.xlsx` y `resumen.json`.
+
+**Todo se procesa en el equipo:** ninguna imagen se envía a internet. Los originales no se modifican.
+
+| Pieza | Técnica | ¿IA? |
+|---|---|---|
+| Leer la etiqueta | OCR con Tesseract (red neuronal local) | Aprendizaje automático ya entrenado, local |
+| Detectar rostros | Cascadas de Haar (Viola–Jones), OpenCV | Aprendizaje automático clásico, local |
+| Agrupar, roles, DPI, revisión | Reglas escritas a mano | No |
+
+El programa **no reconoce a las personas por el rostro**: solo mide el tamaño de la cara para elegir el retrato.
+
+## Requisitos y uso
+
+- Python 3.12, Tesseract OCR y las librerías `opencv-python` (versión 4), `numpy`, `pytesseract` y `openpyxl`. El archivo `Instalar_Python_Tesseract_y_librerias.bat` los instala.
+- Ejecución: `python organizar_fotos.py "C:\ruta\carpeta"`. Opciones: `--salida`, `--solo-analizar`, `--sin-ventana`.
+
+```
+Carpeta ─► analizar ─► agrupar_personas ─► asignar_roles ─► emparejar_dpi ─► copiar ─► escribir_excel
+```
+
+# Código documentado, sección por sección
+
+## 1. Cabecera, librerías y configuración
+
+Cabecera del archivo: qué hace el programa y cómo se usa desde la línea de comandos.
+
+```{python}
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+FASES 1 y 2: fotos con overlay de NoteCam (medio cuerpo y vivienda) + DPI (frente y reverso).
+
+Qué hace:
+  1. Lee el overlay de cada foto (línea "Nota:" = nombre, y "Tiempo:" = hora de captura).
+  2. Agrupa las fotos por persona (tolerando pequeños errores de OCR).
+  3. Decide cuál es la foto de medio cuerpo: la que tiene la cara más grande
+     (y al menos MIN_CARA_MEDIO_CUERPO del ancho de la foto). El resto son de vivienda.
+     El número que a veces aparece en la nota (¿CUI?) NO se usa para decidir esto,
+     solo se anota en el registro porque servirá para emparejar los DPI.
+  4. Copia (NUNCA mueve) las fotos a una carpeta de salida con el formato de tu macro:
+        nombre_1, nombre_2, nombre_3, nombre_4
+  5. Lo dudoso va a Revision_manual y todo queda en registro_fotos.xlsx.
+
+Compatibilidad con la macro "Ajustar fotos y DPIs":
+  - La macro solo lee archivos .jpg (no .jpeg), así que todo se guarda como .jpg.
+  - La macro encuentra a cada persona SOLO por su archivo "_1.jpg". Una persona sin _1
+    no aparece en el Word. Por eso, si no se detecta el retrato, se propone uno
+    provisional y toda la persona va a Revision_manual para que lo confirmes.
+  - La macro ordena a las personas por la fecha de modificación del "_1.jpg". Aquí se
+    fija esa fecha a la hora real de captura del overlay, para que en el Word queden
+    en el orden en que se hicieron las visitas.
+
+DPI: las imágenes sin overlay se leen como DPI. El reverso trae la zona "IDGTM...<<<" de
+donde sale el CUI (se valida con su dígito de control) y el nombre. Se unen frente y reverso
+por CUI y se asignan a la persona por el número de la nota (si coincide) y/o el nombre.
+Salen como  nombre_DPI1.jpg (frente) y nombre_DPI2.jpg (reverso), derechos. Si no hay
+evidencia clara, van a Revision_manual con el nombre propuesto, nunca se adivina.
+
+Uso:
+    python organizar_fotos.py "C:\\ruta\\carpeta_entrada"
+    python organizar_fotos.py "C:\\ruta\\carpeta_entrada" --salida "C:\\ruta\\salida"
+    python organizar_fotos.py "C:\\ruta\\carpeta_entrada" --solo-analizar   (no copia nada)
+
+Requisitos:
+    pip install opencv-python pytesseract openpyxl numpy
+    + instalar Tesseract OCR (en Windows: https://github.com/UB-Mannheim/tesseract/wiki)
+"""
+```
+
+Librerías. Ninguna se conecta a internet: manejo de archivos y texto (biblioteca estándar), `cv2` (OpenCV) para imágenes y rostros, `numpy` para las matrices de píxeles, `pytesseract` para llamar al lector de texto Tesseract (instalado en el equipo) y `openpyxl` para escribir el Excel.
+
+```{python}
+import argparse
+import difflib
+import json
+import os
+import re
+import shutil
+import sys
+import threading
+import time
+import unicodedata
+from collections import Counter, defaultdict
+from datetime import datetime
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pytesseract
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
+```
+
+**Todos los valores ajustables están aquí.** `OVERLAY_ALTO` y `OVERLAY_ANCHO` definen la zona de la etiqueta; `UMBRALES` son los seis niveles de blanco y negro de la votación; `MIN_CARA_MEDIO_CUERPO` es la cara mínima (proporción del ancho de la foto) para ser retrato; `PARECIDO_NOMBRES` y `MIN_VOTOS` controlan qué tanta tolerancia hay a errores de lectura; `MAX_VIVIENDA` es cuántas fotos de vivienda se consideran normales. Al final se cargan los modelos de rostro y se comprueba que OpenCV sea de la versión 4.
+
+```{python}
+# ----------------------------------------------------------------------------
+# CONFIGURACIÓN (ajusta aquí si hace falta)
+# ----------------------------------------------------------------------------
+# En Windows, si Tesseract no está en el PATH, descomenta y ajusta esta línea:
+# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# Si Tesseract no está en el PATH, se busca solo en las carpetas habituales de Windows.
+# (Ya no hace falta editar nada si lo instalaste con las opciones por defecto.)
+if not shutil.which("tesseract"):
+    for _ruta in (r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                  r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"):
+        if Path(_ruta).exists():
+            pytesseract.pytesseract.tesseract_cmd = _ruta
+            break
+
+EXTENSIONES = {".jpg", ".jpeg", ".png"}
+
+# Zona del overlay: parte inferior izquierda de la foto
+OVERLAY_ALTO = 0.14      # último 14 % de la altura
+OVERLAY_ANCHO = 0.55     # primer 55 % del ancho
+UMBRALES = (90, 100, 110, 120, 130, 140)  # se prueban todos y se vota
+
+# Clasificación medio cuerpo: ancho de la cara / ancho de la foto.
+# En las fotos de prueba, los retratos dan 0.43 a 0.65 y las de vivienda no pasan de 0.19.
+MIN_CARA_MEDIO_CUERPO = 0.22
+
+# Agrupación de nombres: parecido mínimo (0 a 1) para considerarlos la misma persona.
+# Se compara solo el inicio del nombre (el apellido largo a veces se lee cortado).
+PARECIDO_NOMBRES = 0.88
+MIN_LARGO_NUMERO = 8     # dígitos mínimos para considerar que la nota trae un número
+
+# Palabras que no cuentan como nombre/apellido al comparar ("Santos De La Cruz")
+PARTICULAS = {"de", "del", "la", "las", "los", "y"}
+# Cuando aparece una de estas palabras, ahí termina el nombre y empieza la dirección
+PALABRAS_DIRECCION = {"barrio", "aldea", "caserio", "colonia", "canton", "sector", "zona",
+                      "lote", "municipio"}
+
+# Para confiar en un nombre, al menos esta fracción de umbrales debe coincidir
+MIN_VOTOS = 0.34
+
+MAX_VIVIENDA = 3         # _2, _3, _4
+
+if not hasattr(cv2, "CascadeClassifier"):
+    sys.exit('ERROR: tienes OpenCV 5, que no incluye el detector de caras.\n'
+             'Instala la versión 4 con:  python -m pip install "opencv-python<5"')
+
+_CASCADA = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+```
+
+## 2. Utilidades de imagen y de nombres
+
+Funciones pequeñas que usan todas las demás etapas: abrir una imagen y limpiar o comparar nombres. Los nombres salen del OCR con errores (tildes perdidas, letras cambiadas), por eso casi nunca se comparan con `==`.
+
+**leer_imagen(ruta)** — abre la imagen. Usa `np.fromfile` + `cv2.imdecode` porque `cv2.imread` falla con rutas con tildes o espacios en Windows. Devuelve `None` si no se puede abrir.
+
+```{python}
+# ----------------------------------------------------------------------------
+# Utilidades
+# ----------------------------------------------------------------------------
+def leer_imagen(ruta: Path):
+    """Lee imagen soportando rutas con tildes/espacios (importante en Windows)."""
+    datos = np.fromfile(str(ruta), dtype=np.uint8)
+    return cv2.imdecode(datos, cv2.IMREAD_COLOR)
+```
+
+**normalizar_nombre(texto)** — deja el nombre en minúsculas, sin tildes ni espacios. Es el nombre que llevan los archivos (`marialopezperez_1.jpg`).
+
+```{python}
+def normalizar_nombre(texto: str) -> str:
+    """'Catalina  Ixpatac' -> 'catalinaixpatac' (minúsculas, sin tildes ni espacios)."""
+    t = unicodedata.normalize("NFD", texto)
+    t = "".join(c for c in t if unicodedata.category(c) != "Mn")
+    return re.sub(r"[^a-z]", "", t.lower())
+```
+
+**_sin_tildes(texto)** — quita las tildes para poder comparar “María” con “Maria”.
+
+```{python}
+def _sin_tildes(t: str) -> str:
+    t = unicodedata.normalize("NFD", t)
+    return "".join(c for c in t if unicodedata.category(c) != "Mn").lower()
+```
+
+**limpiar_visible(texto)** — deja solo letras, descarta palabras sueltas de ruido y corta el texto donde empieza la dirección (barrio, aldea, etc.), porque la nota mezcla nombre y dirección.
+
+```{python}
+def limpiar_visible(texto: str) -> str:
+    """Nombre legible: solo letras y espacios simples. Quita palabras sueltas de ruido
+    al inicio o al final y corta donde empieza la dirección (Barrio, Aldea...)."""
+    t = re.sub(r"[^A-Za-zÁÉÍÓÚáéíóúÑñÜü ]", " ", texto)
+    palabras = []
+    for w in t.split():
+        if _sin_tildes(w) in PALABRAS_DIRECCION and palabras:
+            break
+        palabras.append(w)
+    while palabras and len(palabras[0]) < 3:
+        palabras.pop(0)
+    while palabras and len(palabras[-1]) < 3:
+        palabras.pop()
+    return " ".join(palabras)
+```
+
+**clave_nombre(nombre)** — las dos primeras palabras significativas (sin partículas como *de*, *del*, *la*). Con eso se decide si dos lecturas son la misma persona.
+
+```{python}
+def clave_nombre(nombre: str) -> str:
+    """Clave para comparar personas: sus dos primeras palabras significativas,
+    sin tildes ni espacios. 'Santos De La Cruz De La Cruz' -> 'santoscruz'."""
+    sig = [w for w in nombre.split() if _sin_tildes(w) not in PARTICULAS][:2]
+    return normalizar_nombre(" ".join(sig))
+```
+
+**mismo_nombre(a, b)** — ¿son la misma persona? Compara las claves con `difflib.SequenceMatcher` y exige un parecido mínimo (`PARECIDO_NOMBRES`).
+
+```{python}
+def mismo_nombre(a: str, b: str) -> bool:
+    """¿Son la misma persona? Compara solo las dos primeras palabras significativas,
+    porque la tercera suele leerse cortada o con ruido."""
+    ka, kb = clave_nombre(a), clave_nombre(b)
+    if not ka or not kb:
+        return False
+    n = min(len(ka), len(kb))
+    if n < 6:
+        return ka == kb
+    return difflib.SequenceMatcher(None, ka[:n], kb[:n]).ratio() >= PARECIDO_NOMBRES
+```
+
+**nombre_consenso(base, lecturas)** — elige el nombre final de un grupo: conserva siempre las dos primeras palabras y acepta una tercera solo si otra lectura la confirma. Evita que se cuele ruido del OCR.
+
+```{python}
+def nombre_consenso(base: str, lecturas: list) -> str:
+    """
+    Nombre que se usará en los archivos. Siempre conserva las dos primeras palabras
+    significativas; una tercera o posterior solo se conserva si otra foto del grupo
+    la confirma (así no se cuelan lecturas con ruido como 'Asce Siok').
+    """
+    palabras, res, sig = base.split(), [], 0
+    otras = [l for l in lecturas if l is not base]
+    for w in palabras:
+        particula = _sin_tildes(w) in PARTICULAS
+        if sig >= 2 and not particula:
+            wl = _sin_tildes(w)
+            apoyo = any(
+                difflib.SequenceMatcher(None, wl, _sin_tildes(x)).ratio() >= 0.85
+                for l in otras for x in l.split()
+            )
+            if not apoyo:
+                break
+        res.append(w)
+        if not particula:
+            sig += 1
+    while res and _sin_tildes(res[-1]) in PARTICULAS:
+        res.pop()
+    return " ".join(res)
+```
+
+**separar_numero_y_nombre(lineas, i, resto)** — a veces la nota trae primero un número y el nombre pasa a la línea siguiente. Esta función separa ambos. Toma la línea siguiente tal cual: si Tesseract deja una línea en blanco en medio, el nombre se pierde en esa lectura (la votación lo compensa; es una mejora posible: saltar líneas vacías).
+
+```{python}
+def separar_numero_y_nombre(lineas, i, resto):
+    """
+    La nota de la línea i trae un número largo. Devuelve (numero, texto_del_nombre).
+    El nombre puede ir en la misma línea (después del número) o en la siguiente.
+    """
+    m = re.search(r"\d[\d ]{6,}\d", resto)
+    numero = re.sub(r"\D", "", m.group(0)) if m else None
+    sobrante = (resto[:m.start()] + " " + resto[m.end():]) if m else resto
+    palabras_ok = [w for w in re.sub(r"[^A-Za-zÁÉÍÓÚáéíóúÑñÜü ]", " ", sobrante).split()
+                   if len(w) >= 3]
+    if len(palabras_ok) >= 2:
+        return numero, sobrante
+    if i + 1 < len(lineas):
+        return numero, lineas[i + 1]
+    return numero, ""
+```
+
+## 3. Lectura de la etiqueta de la foto (OCR)
+
+La etiqueta que la cámara imprime abajo a la izquierda trae la hora y una línea `Nota:` con el nombre. Se recorta esa zona, se lee seis veces con distinto contraste y se vota.
+
+**ocr_overlay(img)** — la función más delicada. Recorta la etiqueta, la pasa a gris, la agranda 3 veces y, **para cada umbral** de `UMBRALES`, la convierte a blanco y negro y la lee con Tesseract (`--psm 6`). En cada línea busca la hora (`RE_TIEMPO`) y la nota (`RE_NOTA`). Al final **vota**: junta lecturas parecidas en grupos (ciclo `for…else`), toma el grupo más grande y devuelve `(nombre, votos/6, hora, número)`.
+
+```{python}
+# ----------------------------------------------------------------------------
+# Lectura del overlay
+# ----------------------------------------------------------------------------
+RE_NOTA = re.compile(r"(?i)\bn[o0a][tl][aáe4d]?\s*[:;.,]\s*(.*)")
+RE_TIEMPO = re.compile(r"(\d{2})\s*-\s*(\d{2})\s*-\s*(\d{4})\s+(\d{1,2})\s*:\s*(\d{2})")
+
+
+def ocr_overlay(img):
+    """
+    Devuelve (nombre_visible, votos_fraccion, hora_datetime_o_None, numero_o_None).
+    Prueba varios umbrales sobre el recorte y vota el resultado más repetido.
+
+    La nota puede venir de dos formas:
+        Nota: Margarita Ixtecoc Morente, Barrio ...
+        Nota: 1874146531407            <- número; el nombre pasa a la línea siguiente
+        Margarita Ixtecoc Morente, Barrio ...
+    """
+    alto, ancho = img.shape[:2]
+    recorte = img[int(alto * (1 - OVERLAY_ALTO)):alto, 0:int(ancho * OVERLAY_ANCHO)]
+    gris = cv2.cvtColor(recorte, cv2.COLOR_BGR2GRAY)
+    gris = cv2.resize(gris, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+
+    nombres, numeros, horas = [], [], []
+    for u in UMBRALES:
+        _, bn = cv2.threshold(gris, u, 255, cv2.THRESH_BINARY)  # texto negro sobre blanco
+        bn = cv2.copyMakeBorder(bn, 25, 25, 25, 25, cv2.BORDER_CONSTANT, value=255)
+        try:
+            texto = pytesseract.image_to_string(bn, config="--psm 6")
+        except pytesseract.TesseractNotFoundError:
+            sys.exit("ERROR: no se encontró Tesseract. Instálalo o ajusta tesseract_cmd.")
+        lineas = texto.splitlines()
+        for i, linea in enumerate(lineas):
+            m = RE_TIEMPO.search(linea)
+            if m:
+                mes, dia, anio, hh, mm = (int(x) for x in m.groups())
+                try:
+                    horas.append(datetime(anio, mes, dia, hh, mm))
+                except ValueError:
+                    pass
+            m = RE_NOTA.search(linea)
+            if not m:
+                continue
+            resto = m.group(1)
+            if len(re.findall(r"\d", resto)) >= MIN_LARGO_NUMERO:
+                num, resto = separar_numero_y_nombre(lineas, i, resto)
+                if num:
+                    numeros.append(num)
+            resto = re.split(r"[,;]", resto)[0]
+            resto = re.sub(r"\d+", " ", resto)
+            visible = limpiar_visible(resto)
+            if len(normalizar_nombre(visible)) >= 5:
+                nombres.append(visible)
+
+    hora = Counter(horas).most_common(1)[0][0] if horas else None
+    numero = Counter(numeros).most_common(1)[0][0] if numeros else None
+    if not nombres:
+        return None, 0.0, hora, numero
+
+    # Votación: lecturas parecidas (mismo inicio) cuentan como el mismo nombre
+    grupos = []  # lista de listas de lecturas
+    for n in nombres:
+        for g in grupos:
+            if mismo_nombre(n, g[0]):
+                g.append(n)
+                break
+        else:
+            grupos.append([n])
+    mejor = max(grupos, key=len)
+    # De ese grupo, la lectura más larga que se repita; si no, la más común
+    comunes = Counter(mejor).most_common()
+    visible = max(comunes, key=lambda c: (c[1], len(c[0])))[0]
+    return visible, len(mejor) / len(UMBRALES), hora, numero
+```
+
+## 4. Detección de rostros
+
+Sirve solo para elegir el retrato: se mide qué tan grande se ve la cara. **No identifica a nadie.** Usa detectores de Haar de OpenCV, que viajan dentro del paquete (no hay conexión a internet).
+
+**_solapan(a, b)** — calcula la *intersección sobre la unión* (IoU) de dos recuadros. Dos detecciones se consideran la misma cara si el IoU es de al menos 0.5.
+
+```{python}
+# ----------------------------------------------------------------------------
+# Detección de cara
+# ----------------------------------------------------------------------------
+_OJOS = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
+_CASCADA_ALT = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_alt.xml")
+_CASCADA_ALT2 = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml")
+
+
+def _solapan(a, b) -> bool:
+    """¿Dos recuadros (x, y, ancho, alto) son prácticamente la misma cara?"""
+    ax, ay, aw, ah = (int(v) for v in a)
+    bx, by, bw, bh = (int(v) for v in b)
+    ix = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+    iy = max(0, min(ay + ah, by + bh) - max(ay, by))
+    inter = ix * iy
+    union = aw * ah + bw * bh - inter
+    return union > 0 and inter / union >= 0.5
+```
+
+**proporcion_cara(img)** — devuelve el ancho de la cara más grande dividido entre el ancho de la foto (0 si no hay cara). Reduce la imagen, ecualiza el histograma, ignora la franja de la etiqueta y acepta una cara solo si la confirma un ojo o un segundo modelo.
+
+```{python}
+def proporcion_cara(img) -> float:
+    """
+    Ancho de la cara más grande / ancho de la foto (0 si no hay cara).
+
+    Una cara detectada solo cuenta si algo la confirma, para descartar falsos positivos
+    (paredes, cubetas...):
+      - se detecta al menos un ojo dentro de ella, o
+      - otro modelo de cara distinto detecta el mismo recuadro.
+    (Los ojos fallan en caras con muchas arrugas o ojos entrecerrados; el segundo criterio
+    cubre esos casos.)
+    """
+    alto, ancho = img.shape[:2]
+    escala = 900.0 / ancho if ancho > 900 else 1.0
+    chica = cv2.resize(img, None, fx=escala, fy=escala) if escala != 1.0 else img
+    gris = cv2.cvtColor(chica, cv2.COLOR_BGR2GRAY)
+    gris = cv2.equalizeHist(gris)
+    # Ignoramos la franja del overlay para no detectar falsos positivos ahí
+    corte = int(gris.shape[0] * (1 - OVERLAY_ALTO))
+    gris = gris[:corte]
+
+    principales = _CASCADA.detectMultiScale(gris, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+    otras = list(_CASCADA_ALT2.detectMultiScale(gris, 1.1, 5, minSize=(40, 40))) + \
+            list(_CASCADA_ALT.detectMultiScale(gris, 1.1, 5, minSize=(40, 40)))
+    validas = []
+    for (x, y, fw, fh) in principales:
+        zona = gris[y:y + int(fh * 0.6), x:x + fw]
+        lado = max(8, int(fw * 0.1))
+        con_ojos = len(_OJOS.detectMultiScale(zona, 1.1, 3, minSize=(lado, lado))) >= 1
+        confirmada = any(_solapan((x, y, fw, fh), o) for o in otras)
+        if con_ojos or confirmada:
+            validas.append(fw)
+    if not validas:
+        return 0.0
+    return float(max(validas)) / gris.shape[1]
+```
+
+**proporcion_cara_laxa(img)** — segunda pasada, más permisiva, que solo se usa cuando un grupo no tiene ningún retrato claro. Prueba varios tamaños y los tres modelos, sin exigir ojos.
+
+```{python}
+def proporcion_cara_laxa(img) -> float:
+    """Segunda oportunidad para fotos sin cara clara (primeros planos, sombrero, etc.):
+    prueba varios tamaños y todos los modelos, sin exigir ojos. Solo se usa cuando el
+    grupo no tiene ningún retrato."""
+    mejor = 0.0
+    for ancho_objetivo in (400, 700):
+        alto, ancho = img.shape[:2]
+        esc = ancho_objetivo / ancho
+        chica = cv2.resize(img, None, fx=esc, fy=esc, interpolation=cv2.INTER_AREA)
+        gris = cv2.equalizeHist(cv2.cvtColor(chica, cv2.COLOR_BGR2GRAY))
+        gris = gris[:int(gris.shape[0] * (1 - OVERLAY_ALTO))]
+        for casc in (_CASCADA, _CASCADA_ALT2, _CASCADA_ALT):
+            for (x, y, fw, fh) in casc.detectMultiScale(gris, 1.05, 3, minSize=(30, 30)):
+                mejor = max(mejor, fw / gris.shape[1])
+    return float(mejor)
+```
+
+## 5. Lectura del DPI
+
+El reverso del DPI trae una zona de lectura mecánica con el CUI y un dígito de control; el frente trae el CUI impreso. Aquí se orienta la imagen, se lee y se valida.
+
+**digito_control(cadena)** — dígito de control del estándar ICAO (pesos 7-3-1 repetidos, suma y último dígito). Sirve para saber si el OCR leyó bien el CUI. Antes de la función se definen las palabras clave del DPI, la expresión regular del CUI y la tabla de correcciones (`O→0`, `I→1`…).
+
+```{python}
+# ----------------------------------------------------------------------------
+# FASE 2: lectura de DPI (frente y reverso)
+# ----------------------------------------------------------------------------
+# Un DPI se reconoce porque NO tiene overlay de NoteCam y su reverso trae la zona de
+# lectura mecánica ("IDGTM...<<<"), de donde sale el CUI (con dígito de control) y el nombre.
+PALABRAS_CLAVE = ("GUATEMALA", "REPUBLICA", "DOCUMENTO", "PERSONAL", "IDENTIFICACION",
+                  "RENAP", "REGISTRO", "NACIONAL", "PERSONAS", "VECINDAD", "ESTADO CIVIL",
+                  "NACIMIENTO", "APELLIDO", "NOMBRE", "CODIGO", "SERIE")
+RE_CUI = re.compile(r"(?<!\d)(\d{4})\s*(\d{5})\s*(\d{4})(?!\d)")
+CORRIGE_DIGITOS = str.maketrans({"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1",
+                                 "B": "8", "S": "5", "Z": "2", "G": "6"})
+
+
+def digito_control(cadena):
+    """Dígito de control ICAO (pesos 7-3-1) usado en la zona de lectura mecánica."""
+    total = 0
+    for i, c in enumerate(cadena):
+        v = int(c) if c.isdigit() else (ord(c) - 55 if c.isalpha() else 0)
+        total += v * (7, 3, 1)[i % 3]
+    return total % 10
+```
+
+**_ocr(gris, psm=6, lista=None)** — pequeña envoltura que llama a Tesseract con un modo de segmentación (`psm`) y, opcionalmente, una lista de caracteres permitidos.
+
+```{python}
+def _ocr(gris, psm=6, lista=None):
+    cfg = f"--psm {psm}"
+    if lista:
+        cfg += f" -c tessedit_char_whitelist={lista}"
+    return pytesseract.image_to_string(gris, config=cfg)
+```
+
+**_preparar(img, ancho=1600)** — deja la imagen del DPI a 1600 px de ancho, en gris y con contraste mejorado (CLAHE, ecualización adaptativa por zonas).
+
+```{python}
+def _preparar(img, ancho=1600):
+    h, w = img.shape[:2]
+    if w != ancho:
+        img = cv2.resize(img, None, fx=ancho / w, fy=ancho / w,
+                         interpolation=cv2.INTER_CUBIC if ancho > w else cv2.INTER_AREA)
+    gris = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gris)
+```
+
+**_puntaje_orientacion(gris)** — cuenta palabras típicas del DPI y signos `<<`; mientras más aparecen, más probable es que la imagen esté derecha.
+
+```{python}
+def _puntaje_orientacion(gris):
+    """Cuántas palabras típicas del DPI aparecen: sirve para saber si está derecho."""
+    chico = cv2.resize(gris, None, fx=0.6, fy=0.6, interpolation=cv2.INTER_AREA)
+    t = _sin_tildes(_ocr(chico)).upper()
+    return sum(1 for p in PALABRAS_CLAVE if p in t) + 3 * t.count("<<")
+```
+
+**orientar(img)** — prueba giros y se queda con el que tiene mejor puntaje. Si uno ya supera el umbral, no prueba los demás (ahorra tiempo).
+
+```{python}
+def orientar(img):
+    """Devuelve (imagen_derecha, puntaje, giro). 'giro' es el código de cv2.rotate o None."""
+    h, w = img.shape[:2]
+    primeros = [None, cv2.ROTATE_180] if w >= h else \
+        [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]
+    mejor, mejor_p, mejor_g = img, -1, None
+    for g in primeros:
+        cand = img if g is None else cv2.rotate(img, g)
+        p = _puntaje_orientacion(_preparar(cand))
+        if p > mejor_p:
+            mejor, mejor_p, mejor_g = cand, p, g
+        if p >= 4:           # ya se lee bien, no hace falta probar más
+            break
+    if mejor_p < 4:          # ninguna orientación inicial sirvió: probar las 4
+        for g in (None, cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_COUNTERCLOCKWISE):
+            cand = img if g is None else cv2.rotate(img, g)
+            p = _puntaje_orientacion(_preparar(cand))
+            if p > mejor_p:
+                mejor, mejor_p, mejor_g = cand, p, g
+    return mejor, mejor_p, mejor_g
+```
+
+**leer_mrz(gris)** — lee la zona de lectura mecánica del reverso: busca `GTM`, toma los dígitos del CUI, corrige confusiones típicas, valida el dígito de control y extrae apellidos y nombres de la línea con `<<`.
+
+```{python}
+def leer_mrz(gris):
+    """Lee las 3 líneas de la zona '<<<' del reverso. Devuelve (cui, cui_valido, apellidos, nombres)."""
+    h = gris.shape[0]
+    zona = gris[int(h * 0.58):, :]
+    lineas = []
+    for y0, psm in ((0.58, 6), (0.58, 4), (0.64, 6), (0.74, 6), (0.74, 7), (0.70, 4)):
+        z = gris[int(h * y0):, :]
+        t = _ocr(z, psm, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<")
+        lineas += [re.sub(r"\s+", "", l) for l in t.splitlines()]
+    lineas = [l for l in lineas if len(l) >= 15]
+    n_lt = max((l.count("<") for l in lineas), default=0)
+
+    cui, valido = None, False
+    for l in lineas:
+        i = l.find("GTM")
+        if 0 <= i <= 3 and len(l) >= i + 17:
+            seg = l[i + 3:i + 17].translate(CORRIGE_DIGITOS)
+            if seg.isdigit():
+                base, ctrl, resto = seg[:9], seg[9], seg[10:14]
+                v = str(digito_control(base)) == ctrl
+                if v or cui is None:
+                    cui, valido = base + resto, v
+                if v:
+                    break
+    apellidos, nombres = "", ""
+    for l in lineas:
+        if "<<" in l and not re.search(r"\d", l.replace("<", "")) and l.count("<") >= 3:
+            partes = [p for p in l.split("<<") if p.strip("<")]
+            if partes:
+                apellidos = partes[0].replace("<", " ").strip()
+                nombres = partes[1].replace("<", " ").strip() if len(partes) > 1 else ""
+                break
+    return cui, valido, apellidos, nombres, n_lt
+```
+
+**_parece_frente(gris)** — decide si la imagen parece el frente de un DPI mirando que el encabezado tenga al menos dos palabras clave.
+
+```{python}
+def _parece_frente(gris) -> bool:
+    """El frente trae el encabezado 'República de Guatemala / Documento Personal...'
+    y el rótulo 'Código único de identificación' en la parte de arriba."""
+    h = gris.shape[0]
+    t = _sin_tildes(_ocr(gris[:int(h * 0.40)], 6)).upper()
+    return sum(1 for p in ("REPUBLICA", "GUATEMALA", "CENTROAMERICA", "DOCUMENTO",
+                           "IDENTIFICACION", "CODIGO", "UNICO") if p in t) >= 2
+```
+
+**leer_frente(gris, es_frente=True)** — lee el CUI impreso en el frente (zona fija y, si hace falta, toda la imagen) y las palabras del nombre.
+
+```{python}
+def leer_frente(gris, es_frente=True):
+    """Lee CUI impreso y nombre/apellidos del frente (zonas fijas de la plantilla)."""
+    h, w = gris.shape[:2]
+    cui = None
+    zona_cui = gris[int(h * 0.15):int(h * 0.33), 0:int(w * 0.36)]
+    for u in (None, 120):
+        z = zona_cui if u is None else cv2.threshold(zona_cui, u, 255, cv2.THRESH_BINARY)[1]
+        t = _ocr(z, 6, "0123456789 ")
+        m = RE_CUI.search(t)
+        if m:
+            cui = "".join(m.groups())
+            break
+    if cui is None and es_frente:
+        # Plantilla distinta (DPI nuevo, otra posición): se busca el CUI en toda la imagen
+        for psm in (6, 11):
+            t = _ocr(gris, psm, "0123456789 ")
+            m = RE_CUI.search(t)
+            if m:
+                cui = "".join(m.groups())
+                break
+            for linea in t.splitlines():
+                run = re.search(r"\d{13}", re.sub(r"\s+", "", linea))
+                if run:
+                    cui = run.group(0)
+                    break
+            if cui:
+                break
+    palabras = []
+    for y0, y1 in ((0.17, 0.32), (0.32, 0.52)):
+        zona = gris[int(h * y0):int(h * y1), int(w * 0.32):int(w * 0.62)]
+        t = _sin_tildes(_ocr(zona, 6)).upper()
+        for w_ in re.findall(r"[A-Z]{4,}", t):
+            if w_ not in ("NOMBRE", "APELLIDO", "NACIONALIDAD") and w_ not in palabras:
+                palabras.append(w_)
+    return cui, palabras
+```
+
+**leer_dpi(img)** — coordina lo anterior. Si encuentra la zona `<<<` es un **reverso**; si no, pero parece frente y se leyó CUI o nombre, es un **frente**; si no, no se reconoce.
+
+```{python}
+def leer_dpi(img):
+    """Devuelve dict: lado ('frente'|'reverso'|None), cui, cui_valido, palabras (nombre)."""
+    img, punt, giro = orientar(img)
+    gris = _preparar(img)
+    res = dict(lado=None, cui=None, cui_valido=False, palabras=[], giro=giro,
+               orientacion_ok=punt >= 4)
+    cui_m, val_m, ap, no, n_lt = leer_mrz(gris)
+    if ap and (cui_m or no):
+        res.update(lado="reverso", cui=cui_m, cui_valido=val_m,
+                   palabras=[p for p in re.findall(r"[A-Z]{3,}", _sin_tildes(ap + " " + no).upper())])
+        return res
+    if n_lt >= 8 or cui_m:
+        # Se ve la zona de '<<<' (es un reverso) aunque no se haya podido leer bien el nombre
+        res.update(lado="reverso", cui=cui_m, cui_valido=val_m, palabras=[])
+        return res
+    frente = _parece_frente(gris)
+    cui_f, pal = leer_frente(gris, es_frente=frente)
+    if cui_f or (punt >= 4 and len(pal) >= 2 and frente):
+        res.update(lado="frente", cui=cui_f, cui_valido=False, palabras=pal)
+    return res
+```
+
+## 6. Ventana de avance
+
+Muestra al usuario cómo va el procesamiento (etapa, imagen N de M, tiempo). Solo exhibe el nombre original del archivo; nunca nombres de personas ni miniaturas.
+
+**Progreso** — objeto que comparten el hilo que trabaja y la ventana que lo muestra (etapa actual, imagen N de M, archivo).
+
+```{python}
+# ----------------------------------------------------------------------------
+# Proceso principal
+# ----------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# VENTANA DE AVANCE
+# El usuario ve qué está pasando mientras el programa trabaja (el OCR tarda unos
+# segundos por foto y sin esto parecería que el robot se congeló). La ventana solo
+# muestra el NOMBRE ORIGINAL del archivo y un contador: nunca nombres de personas
+# ni miniaturas de las fotos. Si tkinter no existe o falla, el programa sigue igual,
+# solo que sin ventana.
+# ---------------------------------------------------------------------------
+class Progreso:
+    """Estado compartido entre el hilo que trabaja y la ventana que lo muestra."""
+
+    def __init__(self):
+        self.etapa = "Preparando..."
+        self.i = 0
+        self.total = 0
+        self.archivo = ""
+        self.t0 = time.time()
+        self.fin = False
+
+    def avanzar(self, i, total, archivo):
+        self.etapa = "Leyendo imágenes"
+        self.i, self.total, self.archivo = i, total, archivo
+
+    def fase(self, texto):
+        """Cambia el título de la etapa (agrupar, copiar, Excel...)."""
+        self.etapa, self.archivo = texto, ""
+```
+
+**_mmss(segundos)** — formatea segundos como `m:ss`.
+
+```{python}
+def _mmss(segundos):
+    segundos = max(0, int(segundos))
+    return f"{segundos // 60}:{segundos % 60:02d}"
+```
+
+**ejecutar_con_ventana(trabajo, progreso, usar_ventana=True)** — ejecuta el trabajo pesado en un hilo aparte y mantiene la ventana (`tkinter`) en el hilo principal, para que Windows no la marque como “No responde”. La ventana va siempre al frente. Si `tkinter` no está disponible, el programa corre igual sin ventana. Los errores del trabajo se relanzan al final.
+
+```{python}
+def ejecutar_con_ventana(trabajo, progreso, usar_ventana=True):
+    """Corre trabajo() mostrando una ventana de avance.
+
+    El trabajo pesado va en un hilo aparte y la ventana (tkinter) vive en el hilo
+    principal, así Windows no la marca como "No responde" mientras el OCR trabaja.
+    Cualquier error (o sys.exit) del trabajo se vuelve a lanzar al final.
+    """
+    root = None
+    if usar_ventana:
+        try:
+            import tkinter as tk
+            from tkinter import ttk
+            root = tk.Tk()
+        except Exception:
+            root = None
+    if root is None:
+        trabajo()
+        return
+
+    resultado = {}
+
+    def hilo():
+        try:
+            trabajo()
+        except BaseException as e:  # incluye SystemExit de sys.exit()
+            resultado["error"] = e
+        finally:
+            progreso.fin = True
+
+    th = threading.Thread(target=hilo, daemon=True)
+    th.start()
+
+    root.title("Organizando fotos y DPI")
+    root.resizable(False, False)
+    ancho, alto = 480, 200
+    root.geometry(f"{ancho}x{alto}+{(root.winfo_screenwidth() - ancho) // 2}+{(root.winfo_screenheight() - alto) // 3}")
+    root.attributes("-topmost", True)  # siempre al frente: no se esconde detrás de otras ventanas
+    marco = ttk.Frame(root, padding=18)
+    marco.pack(fill="both", expand=True)
+    titulo = ttk.Label(marco, text="Procesando...", font=("Segoe UI", 13, "bold"))
+    titulo.pack(anchor="w")
+    barra = ttk.Progressbar(marco, mode="determinate", length=440, maximum=100)
+    barra.pack(fill="x", pady=(12, 6))
+    conteo = ttk.Label(marco, text="", font=("Segoe UI", 10))
+    conteo.pack(anchor="w")
+    archivo = ttk.Label(marco, text="", font=("Segoe UI", 9), foreground="#555555")
+    archivo.pack(anchor="w", pady=(4, 0))
+    ttk.Label(marco, text="Todo se procesa en este equipo. No cierre esta ventana hasta que termine.",
+              font=("Segoe UI", 8), foreground="#777777").pack(anchor="w", pady=(10, 0))
+
+    def refrescar():
+        try:
+            titulo.config(text=progreso.etapa)
+            if progreso.total and progreso.etapa == "Leyendo imágenes":
+                barra.config(mode="determinate")
+                barra["value"] = 100.0 * progreso.i / progreso.total
+                transcurrido = time.time() - progreso.t0
+                restante = transcurrido / max(progreso.i - 1, 1) * (progreso.total - progreso.i + 1) if progreso.i > 1 else None
+                texto = f"Imagen {progreso.i} de {progreso.total}  ·  transcurrido {_mmss(transcurrido)}"
+                if restante is not None:
+                    texto += f"  ·  restante aprox. {_mmss(restante)}"
+                conteo.config(text=texto)
+            else:
+                conteo.config(text=f"Transcurrido {_mmss(time.time() - progreso.t0)}")
+                if progreso.etapa != "Leyendo imágenes":
+                    barra["value"] = 100 if progreso.total and progreso.i >= progreso.total else barra["value"]
+            archivo.config(text=progreso.archivo)
+        except Exception:
+            pass
+        if progreso.fin:
+            root.destroy()
+            return
+        root.after(200, refrescar)
+
+    # Si el usuario cierra la ventana, el programa sigue trabajando sin ella.
+    root.protocol("WM_DELETE_WINDOW", root.destroy)
+    root.after(0, refrescar)
+    root.mainloop()
+    th.join()
+    if "error" in resultado:
+        raise resultado["error"]
+```
+
+## 7. Etapas del proceso
+
+Cada etapa recibe la lista de *fichas* (un diccionario por imagen) y le agrega campos. Orden: `analizar` → `agrupar_personas` → `asignar_roles` → `emparejar_dpi`.
+
+**analizar(carpeta, progreso=None)** — ciclo principal: **una vuelta por cada imagen**. Lee la etiqueta; si no hay, intenta reconocerla como DPI; si hay etiqueta con nombre, mide además el tamaño de la cara. Devuelve una ficha (diccionario) por imagen.
+
+```{python}
+def analizar(carpeta: Path, progreso=None):
+    archivos = sorted(
+        p for p in carpeta.iterdir() if p.is_file() and p.suffix.lower() in EXTENSIONES
+    )
+    registros = []
+    total = len(archivos)
+    for i, ruta in enumerate(archivos, 1):
+        print(f"[{i}/{total}] {ruta.name}", flush=True)
+        if progreso:
+            progreso.avanzar(i, total, ruta.name)
+        img = leer_imagen(ruta)
+        if img is None:
+            registros.append(dict(ruta=ruta, estado="REVISAR", nombre=None,
+                                  detalle="no se pudo abrir la imagen"))
+            continue
+        nombre, votos, hora, numero = ocr_overlay(img)
+        if nombre is None and hora is None and numero is None:
+            dpi = leer_dpi(img)
+            if dpi["lado"]:
+                registros.append(dict(ruta=ruta, nombre=None, tipo="dpi", lado=dpi["lado"],
+                                      dpi_cui=dpi["cui"], dpi_valido=dpi["cui_valido"],
+                                      dpi_palabras=dpi["palabras"], giro=dpi["giro"],
+                                      estado="Leída"))
+            else:
+                registros.append(dict(ruta=ruta, nombre=None, estado="Sin overlay",
+                                      detalle="no es foto con overlay ni se reconoció como DPI"))
+            continue
+        if nombre is None:
+            # Tiene overlay (se leyó hora o número) pero no se pudo leer el nombre
+            registros.append(dict(ruta=ruta, nombre=None, hora=hora, numero=numero,
+                                  estado="REVISAR",
+                                  detalle="overlay detectado pero no se pudo leer el nombre"))
+            continue
+        registros.append(dict(
+            ruta=ruta, nombre=nombre, votos=votos, hora=hora, numero=numero,
+            cara=proporcion_cara(img), estado="Leída",
+        ))
+    return registros
+```
+
+**agrupar_personas(registros)** — junta las fichas de la misma persona. Ordena por confianza y, con el ciclo `for…else`, mete cada ficha en un grupo existente o abre uno nuevo. Si dos fichas traen números de nota distintos, son personas distintas aunque el nombre se parezca. Cada grupo elige su nombre final.
+
+```{python}
+def agrupar_personas(registros):
+    """Agrupa por persona. Devuelve [(clave, [registros])] y fija 'persona' en cada uno."""
+    con_nombre = [r for r in registros if r.get("nombre")]
+    grupos = []  # [[registros]]
+    for r in sorted(con_nombre, key=lambda x: -x["votos"]):
+        for g in grupos:
+            if not any(mismo_nombre(r["nombre"], o["nombre"]) for o in g):
+                continue
+            # Dos números distintos en la nota = dos personas distintas
+            if r.get("numero") and any(o.get("numero") and o["numero"] != r["numero"] for o in g):
+                continue
+            g.append(r)
+            break
+        else:
+            grupos.append([r])
+
+    claves = []
+    for g in grupos:
+        # Nombre base: la lectura más repetida y, en empate, la más larga
+        cuenta = Counter(r["nombre"] for r in g)
+        base = max(cuenta, key=lambda n: (cuenta[n], len(n)))
+        final = nombre_consenso(base, [r["nombre"] for r in g]) or base
+        clave = normalizar_nombre(final)
+        for r in g:
+            r["persona"] = clave
+            r["nombre_final"] = final
+        claves.append((clave, g))
+    return claves
+```
+
+**asignar_roles(claves)** — por cada persona: la foto con la cara más grande (si llega a `MIN_CARA_MEDIO_CUERPO`) es el retrato `_1`; las demás se ordenan por hora (`_2`, `_3`…). Si no hay retrato claro, propone uno provisional y marca el grupo para revisión. Fija la hora del grupo (la más temprana), que luego se usa como fecha del archivo para ordenar a las personas en Word.
+
+```{python}
+def asignar_roles(claves):
+    for rep, lista in claves:
+        for r in lista:
+            r["rol"] = None
+            r["criterio"] = ""
+            r["aviso"] = ""
+
+        # Si ninguna cara supera el mínimo, segunda pasada más permisiva sobre el grupo
+        if max(r["cara"] for r in lista) < MIN_CARA_MEDIO_CUERPO:
+            for r in lista:
+                img_r = leer_imagen(r["ruta"])
+                if img_r is not None:
+                    r["cara"] = max(r["cara"], proporcion_cara_laxa(img_r))
+
+        # Foto de medio cuerpo: la de la cara más grande (si supera el mínimo)
+        medio = None
+        candidata = max(lista, key=lambda r: r["cara"])
+        if candidata["cara"] >= MIN_CARA_MEDIO_CUERPO:
+            medio = candidata
+            medio["criterio"] = f"cara grande ({candidata['cara']:.2f})"
+            medio["rol"] = "medio_cuerpo"
+            medio["nuevo"] = f"{rep}_1"
+
+        resto = [r for r in lista if r is not medio]
+        resto.sort(key=lambda r: (r["hora"] or datetime.max, r["ruta"].name))
+        for n, r in enumerate(resto, start=2):
+            # Más de 3 fotos de vivienda: la macro admite _5, _6... y las agrega al orden
+            r["rol"] = "vivienda" if n <= MAX_VIVIENDA + 1 else "vivienda_extra"
+            r["nuevo"] = f"{rep}_{n}"
+
+        # Sin retrato claro: se propone uno PROVISIONAL (cara más grande; si hay empate,
+        # la más temprana) para que el grupo tenga su _1. Sin _1 la macro ignora a la persona.
+        provisional = False
+        if medio is None:
+            provisional = True
+            medio = sorted(lista, key=lambda r: (-r["cara"], r["hora"] or datetime.max,
+                                                 r["ruta"].name))[0]
+            medio["criterio"] = "PROVISIONAL (ninguna cara supera el mínimo)"
+            medio["rol"] = "medio_cuerpo"
+            medio["nuevo"] = f"{rep}_1"
+            resto = [r for r in lista if r is not medio]
+            resto.sort(key=lambda r: (r["hora"] or datetime.max, r["ruta"].name))
+            for n, r in enumerate(resto, start=2):
+                r["rol"] = "vivienda" if n <= MAX_VIVIENDA + 1 else "vivienda_extra"
+                r["nuevo"] = f"{rep}_{n}"
+
+        # Hora de la visita = la foto más temprana del grupo (sirve para ordenar en Word)
+        horas = [r["hora"] for r in lista if r.get("hora")]
+        hora_grupo = min(horas) if horas else None
+        for r in lista:
+            r["hora_grupo"] = hora_grupo
+            r["provisional"] = provisional
+
+        # Estado del grupo
+        problemas = []
+        if provisional:
+            problemas.append("NO HAY RETRATO CLARO: elige la foto de medio cuerpo; "
+                             "sin _1 la persona no sale en Word")
+        if len(resto) < MAX_VIVIENDA:
+            problemas.append(f"solo {len(resto)} foto(s) de vivienda")
+        if len(resto) > MAX_VIVIENDA:
+            pass  # fotos adicionales: se numeran _5, _6... y no es un problema
+        for r in lista:
+            r["completo"] = not problemas
+            r["estado"] = "OK"
+            partes = []
+            if r["aviso"]:
+                partes.append(r["aviso"])
+            # Baja confianza solo si ninguna otra foto del grupo respalda el nombre
+            respaldo = any(o is not r and o["votos"] >= MIN_VOTOS for o in lista)
+            if r["votos"] < MIN_VOTOS and not respaldo:
+                r["estado"] = "REVISAR"
+                partes.append("nombre leído con baja confianza")
+            if r["rol"] == "vivienda_extra":
+                partes.append("foto adicional (más de 4)")
+            if r["rol"] is None:
+                r["estado"] = "REVISAR"
+                partes.append("sin rol asignado")
+            if provisional:
+                r["estado"] = "REVISAR"
+            if problemas:
+                partes.append("grupo: " + ", ".join(problemas))
+            r["detalle"] = "; ".join(partes)
+```
+
+**_dif_digitos(a, b)** — cuántos dígitos difieren entre dos CUI.
+
+```{python}
+# ----------------------------------------------------------------------------
+# Emparejar DPI con personas
+# ----------------------------------------------------------------------------
+def _dif_digitos(a: str, b: str) -> int:
+    if not a or not b or len(a) != len(b):
+        return 99
+    return sum(x != y for x, y in zip(a, b))
+```
+
+**_palabras_persona(nombre)** — palabras del nombre de una persona sin partículas, para compararlas con las del DPI.
+
+```{python}
+def _palabras_persona(nombre: str):
+    return [_sin_tildes(w).lower() for w in nombre.split()
+            if _sin_tildes(w).lower() not in PARTICULAS and len(w) >= 4]
+```
+
+**_coinciden(pal_persona, pal_dpi)** — cuántas palabras coinciden entre el nombre de una persona y el del DPI.
+
+```{python}
+def _coinciden(pal_persona, pal_dpi) -> int:
+    """Cuántas palabras del nombre de la persona aparecen (casi iguales) en el DPI."""
+    dpi = [p.lower() for p in pal_dpi if len(p) >= 4]
+    return sum(
+        1 for w in pal_persona
+        if any(difflib.SequenceMatcher(None, w, p).ratio() >= 0.8 for p in dpi)
+    )
+```
+
+**emparejar_dpi(registros, claves)** — la parte más larga. *Fase 1:* une cada reverso con su frente por la diferencia de dígitos del CUI (primero las coincidencias exactas). *Fase 2:* asigna cada pareja a una persona con un puntaje (CUI coincidente = 100×(3−d), más palabras del nombre); un CUI distinto excluye a la persona. *Fase 3:* resuelve choques; los DPI sin dueño quedan como `DPI_sin_asignar_N_lado` en revisión.
+
+```{python}
+def emparejar_dpi(registros, claves):
+    """
+    1) Une cada reverso con su frente por el CUI (el del reverso trae dígito de control).
+    2) Asigna cada pareja a una persona: por el número de la nota (si coincide con el CUI)
+       y/o por el nombre. Solo se acepta si la evidencia es clara y sin empate.
+    """
+    dpis = [r for r in registros if r.get("tipo") == "dpi"]
+    if not dpis:
+        return
+    reversos = [r for r in dpis if r["lado"] == "reverso"]
+    frentes = [r for r in dpis if r["lado"] == "frente"]
+
+    # --- 1) frente <-> reverso, por CUI (tolera hasta 2 dígitos mal leídos en el frente) ---
+    pares = []   # [reverso|None, frente|None]
+    # Se unen primero los que coinciden mejor (diferencia 0), luego 1 y 2 dígitos, para que
+    # un frente con CUI casi igual al de otro DPI no se lleve el reverso equivocado.
+    combos = sorted(
+        (_dif_digitos(rv.get("dpi_cui") or "", f.get("dpi_cui") or ""), i, j)
+        for i, rv in enumerate(reversos) for j, f in enumerate(frentes))
+    usado_rv, usado_fr, union = set(), set(), {}
+    for d, i, j in combos:
+        if d > 2:
+            break
+        if i in usado_rv or j in usado_fr:
+            continue
+        # si otro frente libre queda igual de cerca, es ambiguo: no se une
+        otros = [d2 for d2, i2, j2 in combos if i2 == i and j2 != j and j2 not in usado_fr and d2 <= d]
+        if otros:
+            continue
+        usado_rv.add(i); usado_fr.add(j); union[i] = j
+    libres = [f for j, f in enumerate(frentes) if j not in usado_fr]
+    for i, rv in enumerate(reversos):
+        pares.append([rv, frentes[union[i]] if i in union else None])
+    # Reversos sin frente: se unen a un frente libre por apellido/nombre cuando a alguno
+    # de los dos no se le pudo leer el CUI.
+    for par in pares:
+        if par[1] is None:
+            pal_rv = [p.lower() for p in par[0].get("dpi_palabras", []) if len(p) >= 4]
+            cand = [f for f in libres
+                    if (not f.get("dpi_cui") or not par[0].get("dpi_cui")) and pal_rv and
+                    _coinciden(pal_rv, f.get("dpi_palabras", [])) >= 1]
+            if len(cand) == 1:
+                par[1] = cand[0]
+                libres.remove(cand[0])
+    pares += [[None, f] for f in libres]
+
+    # --- 2) pareja -> persona ---
+    # Regla clave: si la persona tiene número de nota (CUI) y el CUI del DPI es otro,
+    # ese DPI NO es de ella aunque comparta apellidos (familiares). Una sola palabra
+    # de nombre nunca basta.
+    asignaciones = []
+    for rv, fr in pares:
+        cui = (rv or {}).get("dpi_cui") or (fr or {}).get("dpi_cui") or ""
+        palabras = ((rv or {}).get("dpi_palabras") or []) + ((fr or {}).get("dpi_palabras") or [])
+        valido = bool((rv or {}).get("dpi_valido"))
+        cands = []
+        for clave, lista in claves:
+            nombre = lista[0].get("nombre_final", "")
+            nums = {r["numero"] for r in lista if r.get("numero")}
+            d = min((_dif_digitos(cui, n) for n in nums), default=99) if cui else 99
+            por_cui = d <= 2
+            if cui and nums and not por_cui:
+                continue                      # CUI distinto: otra persona
+            pal_p = _palabras_persona(nombre)
+            n_pal = _coinciden(pal_p, palabras)
+            # el nombre de pila (primera palabra) pesa un poco más: desempata hermanas/familiares
+            bonus = 0.5 if pal_p and _coinciden(pal_p[:1], palabras) else 0
+            debil = False
+            if not por_cui and n_pal < 2:
+                # Solo el nombre de pila coincide: se propone (nunca como seguro) si el DPI
+                # está completo y su CUI es válido; el programa lo deja en revisión.
+                if n_pal == 1 and bonus and valido and rv and fr:
+                    debil = True
+                else:
+                    continue                  # no alcanza
+            cands.append(((100 * (3 - d) if por_cui else 0) + n_pal + bonus, por_cui, n_pal, clave, debil))
+        cands.sort(reverse=True)
+        mejor = cands[0] if cands else (0, False, 0, None, False)
+        sin_empate = len(cands) < 2 or mejor[0] > cands[1][0]
+        motivos = []
+        if mejor[1]:
+            motivos.append("CUI coincide con la nota de la persona")
+        if mejor[3] and mejor[2]:
+            motivos.append(f"{mejor[2]} palabra(s) del nombre coinciden")
+        if mejor[4]:
+            motivos.append("solo coincide el nombre de pila: confirmar")
+        if rv and fr:
+            motivos.append("frente y reverso unidos por CUI")
+        if valido:
+            motivos.append("CUI del reverso válido")
+        alta = bool(mejor[3]) and sin_empate and not mejor[4] and (mejor[1] or (valido or (rv and fr)))
+        asignaciones.append(dict(rv=rv, fr=fr, clave=mejor[3], score=mejor[0], por_cui=mejor[1],
+                                 alta=alta, sin_empate=sin_empate, motivos=motivos))
+
+    # Si varias parejas quieren a la misma persona: gana la que coincide por CUI;
+    # las demás pasan a "sin asignar" (suelen ser familiares u otras personas sin fotos).
+    por_persona = {}
+    for a_ in asignaciones:
+        if a_["clave"]:
+            por_persona.setdefault(a_["clave"], []).append(a_)
+    for clave, lista in por_persona.items():
+        if len(lista) < 2:
+            continue
+        lista.sort(key=lambda x: x["score"], reverse=True)
+        if lista[0]["por_cui"] and lista[0]["score"] > lista[1]["score"]:
+            for perdedor in lista[1:]:
+                perdedor["clave"] = None
+        else:
+            for a_ in lista:
+                a_["choque"] = True
+
+    n_huerfano = 0
+    for a_ in asignaciones:
+        rv, fr, clave = a_["rv"], a_["fr"], a_["clave"]
+        if not clave:
+            n_huerfano += 1
+        for r in (rv, fr):
+            if not r:
+                continue
+            r["criterio"] = "; ".join(a_["motivos"])
+            if clave and a_["alta"] and not a_.get("choque"):
+                r["persona"] = clave
+                r["nuevo"] = f"{clave}_DPI{1 if r['lado'] == 'frente' else 2}"
+                r["estado"] = "OK"
+                r["detalle"] = "" if (rv and fr) else "falta " + ("el reverso" if r["lado"] == "frente" else "el frente")
+            elif clave:
+                r["persona"] = clave
+                r["nuevo"] = f"{clave}_DPI{1 if r['lado'] == 'frente' else 2}"
+                r["estado"] = "REVISAR"
+                r["detalle"] = ("dos DPI quieren la misma persona" if a_.get("choque") else
+                                "persona probable, evidencia insuficiente" if a_["sin_empate"] else
+                                "empate entre varias personas")
+            else:
+                r["nuevo"] = f"DPI_sin_asignar_{n_huerfano}_{r['lado']}"
+                r["estado"] = "REVISAR"
+                r["detalle"] = "no coincide con ninguna persona del lote (¿familiar o persona sin fotos?)"
+            if not r.get("orientacion_ok", True):
+                r["estado"] = "REVISAR"
+                r["detalle"] = (r["detalle"] + "; " if r["detalle"] else "") + "orientación dudosa"
+```
+
+## 8. Salida y programa principal
+
+Copia con el nombre final, genera el Excel de registro y el `resumen.json`. Los originales nunca se modifican.
+
+**guardar_como_jpg(origen, destino, giro=None)** — copia el archivo como `.jpg` (un `.jpeg` se copia tal cual, un `.png` se convierte, un DPI girado se endereza). No toca el original.
+
+```{python}
+def guardar_como_jpg(origen: Path, destino: Path, giro=None):
+    """Copia la foto como .jpg. Un .jpeg es el mismo formato, solo cambia la extensión;
+    un .png se convierte de verdad; si 'giro' viene, se endereza (DPI girado).
+    El original no se toca."""
+    if giro is None and origen.suffix.lower() in (".jpg", ".jpeg"):
+        shutil.copy2(origen, destino)
+        return
+    img = leer_imagen(origen)
+    if giro is not None:
+        img = cv2.rotate(img, giro)
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    if not ok:
+        raise RuntimeError(f"No se pudo convertir {origen.name} a JPG")
+    buf.tofile(str(destino))
+```
+
+**copiar(registros, salida)** — crea `_salida` y `Revision_manual`; las fotos en estado OK van a la primera y las demás a la segunda. Evita sobrescribir nombres repetidos y fija la fecha de modificación con `os.utime`, porque la macro de Word ordena por esa fecha.
+
+```{python}
+def copiar(registros, salida: Path):
+    ok_dir = salida
+    rev_dir = salida / "Revision_manual"
+    ok_dir.mkdir(parents=True, exist_ok=True)
+    rev_dir.mkdir(parents=True, exist_ok=True)
+    for r in registros:
+        ruta = r["ruta"]
+        if r.get("nuevo"):
+            carpeta = ok_dir if r.get("estado") == "OK" else rev_dir
+            destino = carpeta / (r["nuevo"] + ".jpg")
+        else:
+            destino = rev_dir / ruta.name  # sin nombre propuesto: se conserva el original
+        if destino.exists():
+            destino = destino.with_name(f"{destino.stem}__dup_{ruta.stem}{destino.suffix}")
+        r["destino"] = str(destino)
+        if r.get("nuevo"):
+            guardar_como_jpg(ruta, destino, r.get("giro"))
+            # La macro ordena por fecha de modificación: se fija la hora real de la visita
+            if r.get("hora_grupo"):
+                t = r["hora_grupo"].timestamp()
+                os.utime(destino, (t, t))
+        else:
+            shutil.copy2(ruta, destino)
+```
+
+**escribir_excel(registros, ruta_xlsx, claves)** — crea `registro_fotos.xlsx` con la hoja *Registro* (una fila por imagen, con colores) y la hoja *Por persona*. Si el archivo está abierto, lo guarda con otro nombre.
+
+```{python}
+def escribir_excel(registros, ruta_xlsx: Path, claves):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Registro"
+    cols = ["Archivo original", "Nombre leído", "Persona (clave)", "Número en nota",
+            "Hora captura", "Tamaño cara", "Rol", "Criterio", "Nombre nuevo",
+            "Estado", "Detalle", "Destino"]
+    ws.append(cols)
+    encabezado = PatternFill("solid", fgColor="305496")
+    for c in ws[1]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = encabezado
+    rojo = PatternFill("solid", fgColor="F8CBAD")      # REVISAR
+    amarillo = PatternFill("solid", fgColor="FFF2CC")  # OK pero con advertencia
+    gris = PatternFill("solid", fgColor="E7E6E6")      # sin overlay
+    for r in registros:
+        ws.append([
+            r["ruta"].name, r.get("nombre") or " ".join(r.get("dpi_palabras") or []),
+            r.get("persona") or "",
+            str(r.get("numero") or r.get("dpi_cui") or ""),  # texto, para que Excel no lo redondee
+            r["hora"].strftime("%Y-%m-%d %H:%M") if r.get("hora") else "",
+            round(r["cara"], 3) if r.get("cara") is not None else "",
+            (("dpi_" + r["lado"]) if r.get("tipo") == "dpi" else r.get("rol")) or "", r.get("criterio") or "", r.get("nuevo") or "",
+            r.get("estado", ""), r.get("detalle", ""), r.get("destino", ""),
+        ])
+        ws.cell(row=ws.max_row, column=4).number_format = "@"
+        if r.get("estado") == "REVISAR":
+            color = rojo
+        elif r.get("estado") == "Sin overlay":
+            color = gris
+        elif r.get("detalle"):
+            color = amarillo
+        else:
+            color = None
+        if color:
+            for c in ws[ws.max_row]:
+                c.fill = color
+    for i, ancho in enumerate([34, 26, 28, 18, 17, 12, 20, 18, 30, 13, 70, 60], start=1):
+        ws.column_dimensions[get_column_letter(i)].width = ancho
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+    # Hoja 2: una fila por persona, para revisar de un vistazo
+    w2 = wb.create_sheet("Por persona")
+    w2.append(["Persona (clave)", "Nombre", "Fotos", "Medio cuerpo", "Vivienda",
+               "Número en nota", "DPI", "Estado"])
+    for c in w2[1]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = encabezado
+    for clave, lista in sorted(claves, key=lambda x: x[0]):
+        medio = sum(1 for r in lista if r.get("rol") == "medio_cuerpo")
+        viv = sum(1 for r in lista if r.get("rol") == "vivienda")
+        nums = sorted({r["numero"] for r in lista if r.get("numero")})
+        provisional = any(r.get("provisional") for r in lista)
+        hay_revisar = any(r.get("estado") == "REVISAR" for r in lista)
+        lados = {r["lado"] for r in registros
+                 if r.get("tipo") == "dpi" and r.get("persona") == clave and r.get("estado") == "OK"}
+        dudosos = any(r.get("tipo") == "dpi" and r.get("persona") == clave
+                      and r.get("estado") == "REVISAR" for r in registros)
+        dpi_txt = ("frente + reverso" if lados == {"frente", "reverso"} else
+                   ("solo " + next(iter(lados))) if lados else "SIN DPI")
+        if dudosos:
+            dpi_txt += " (hay DPI por revisar)"
+        if provisional:
+            estado = "SIN RETRATO: no saldrá en Word hasta confirmar _1"
+        elif hay_revisar:
+            estado = "Revisar fotos"
+        elif viv < MAX_VIVIENDA:
+            estado = f"OK (solo {viv} foto(s) de vivienda)"
+        else:
+            estado = "Completo"
+        w2.append([clave, lista[0].get("nombre_final", ""), len(lista),
+                   "PROVISIONAL" if provisional else ("sí" if medio else "NO"),
+                   viv, ", ".join(nums), dpi_txt, estado])
+        w2.cell(row=w2.max_row, column=6).number_format = "@"
+        if provisional or hay_revisar or dudosos or not lados:
+            for c in w2[w2.max_row]:
+                c.fill = rojo if provisional else amarillo
+    for i, ancho in enumerate([32, 30, 8, 14, 10, 28, 30, 52], start=1):
+        w2.column_dimensions[get_column_letter(i)].width = ancho
+    w2.freeze_panes = "A2"
+    try:
+        wb.save(ruta_xlsx)
+    except PermissionError:
+        # Casi siempre: el Excel anterior sigue abierto. Se guarda con otro nombre.
+        alterno = ruta_xlsx.with_name(f"registro_fotos_{datetime.now():%H%M%S}.xlsx")
+        wb.save(alterno)
+        print(f"\nAVISO: no se pudo escribir {ruta_xlsx.name} (¿está abierto en Excel?).\n"
+              f"       El registro se guardó como: {alterno.name}")
+        return alterno
+    return ruta_xlsx
+```
+
+**main()** — lee los argumentos (`argparse`), comprueba que `_salida` no tenga fotos de otra corrida y ejecuta las etapas en orden dentro de `ejecutar_con_ventana`. Imprime el resumen y escribe `resumen.json`, que UiPath puede leer.
+
+```{python}
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("entrada", type=Path, help="carpeta con las fotos")
+    ap.add_argument("--salida", type=Path, help="carpeta de salida (por defecto: entrada/_salida)")
+    ap.add_argument("--solo-analizar", action="store_true",
+                    help="genera el Excel sin copiar archivos")
+    ap.add_argument("--sin-ventana", action="store_true",
+                    help="no mostrar la ventana de avance (solo texto en consola)")
+    args = ap.parse_args()
+
+    if not args.entrada.is_dir():
+        sys.exit(f"No existe la carpeta: {args.entrada}")
+    salida = args.salida or (args.entrada / "_salida")
+
+    if not args.solo_analizar:
+        previas = [f for f in salida.glob("*.jpg")] + [f for f in (salida / "Revision_manual").glob("*.jpg")]
+        if previas:
+            sys.exit(f"La carpeta {salida} ya tiene {len(previas)} foto(s) de otra corrida.\n"
+                     "Bórrala (o muévela) antes de volver a ejecutar, o usa --salida con otra carpeta,\n"
+                     "para que no se mezclen archivos viejos con los nuevos.")
+
+    progreso = Progreso()
+    estado = {}
+
+    def trabajo():
+        registros = analizar(args.entrada, progreso)
+        progreso.fase("Agrupando personas y asignando fotos")
+        claves = agrupar_personas(registros)
+        asignar_roles(claves)
+        progreso.fase("Emparejando los DPI")
+        emparejar_dpi(registros, claves)
+        if not args.solo_analizar:
+            progreso.fase("Copiando y renombrando archivos")
+            copiar(registros, salida)
+        progreso.fase("Guardando el registro en Excel")
+        salida.mkdir(parents=True, exist_ok=True)
+        xlsx = salida / "registro_fotos.xlsx"
+        estado.update(registros=registros, claves=claves,
+                      xlsx=escribir_excel(registros, xlsx, claves) or xlsx)
+
+    ejecutar_con_ventana(trabajo, progreso, usar_ventana=not args.sin_ventana)
+    registros, claves, xlsx = estado["registros"], estado["claves"], estado["xlsx"]
+
+    fotos = [r for r in registros if r.get("tipo") != "dpi"]
+    dpis = [r for r in registros if r.get("tipo") == "dpi"]
+    ok = sum(1 for r in fotos if r.get("estado") == "OK")
+    rev = sum(1 for r in fotos if r.get("estado") == "REVISAR")
+    sin = sum(1 for r in registros if r.get("estado") == "Sin overlay")
+    sin_retrato = [c for c, l in claves if any(r.get("provisional") for r in l)]
+    con_dpi = {r["persona"] for r in dpis if r.get("estado") == "OK" and r.get("persona")}
+    sin_dpi = [c for c, l in claves if c not in con_dpi]
+    print("\n=== RESUMEN ===")
+    print(f"Personas detectadas : {len(claves)}")
+    print(f"  SIN retrato claro : {len(sin_retrato)}  (no saldrían en Word hasta confirmar su _1)")
+    for c in sin_retrato:
+        print(f"      - {c}")
+    print(f"Fotos OK            : {ok}")
+    print(f"Fotos a revisión    : {rev}")
+    print(f"DPI leídos          : {len(dpis)}  (OK: {sum(1 for r in dpis if r['estado'] == 'OK')}, "
+          f"a revisión: {sum(1 for r in dpis if r['estado'] == 'REVISAR')})")
+    print(f"  personas sin DPI  : {len(sin_dpi)}")
+    for c in sin_dpi:
+        print(f"      - {c}")
+    print(f"Sin reconocer       : {sin}")
+    print(f"Registro            : {xlsx}")
+
+    # Resumen en JSON para que UiPath (u otro programa) lo lea sin analizar el texto
+    en_revision = len(list((salida / "Revision_manual").glob("*"))) if (salida / "Revision_manual").exists() else 0
+    resumen = dict(
+        personas=len(claves), sin_retrato=len(sin_retrato), fotos_ok=ok, fotos_revision=rev,
+        dpi_leidos=len(dpis), dpi_ok=sum(1 for r in dpis if r["estado"] == "OK"),
+        personas_sin_dpi=len(sin_dpi), sin_reconocer=sin, archivos_en_revision=en_revision,
+        carpeta_salida=str(salida), registro=str(xlsx), solo_analizar=bool(args.solo_analizar))
+    (salida / "resumen.json").write_text(json.dumps(resumen, ensure_ascii=False, indent=2),
+                                         encoding="utf-8")
+```
+
+Punto de entrada: solo se ejecuta `main()` cuando el archivo se corre directamente.
+
+```{python}
+if __name__ == "__main__":
+    main()
+```
+
